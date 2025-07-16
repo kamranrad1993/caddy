@@ -926,6 +926,7 @@ func (h adminHandler) getOrigin(r *http.Request) (string, *url.URL) {
 	if err != nil {
 		return origin, nil
 	}
+	originURL.Host = origin
 	originURL.Path = ""
 	originURL.RawPath = ""
 	originURL.Fragment = ""
