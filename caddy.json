@@ -1,7 +1,7 @@
 {
     "admin": {
         "listen": "127.0.0.1:2019",
-        "enforce_origin": true,
+        "enforce_origin": false,
         "origins": [
             "http://localhost:2019",
             "localhost:2019",

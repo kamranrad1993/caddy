@@ -4,6 +4,10 @@ Caddyfile
 Caddyfile.*
 !caddyfile/
 !caddyfile.go
+/caddy
+/main
+cmd/__debug*
+cmd/caddy/__*
 
 # artifacts from pprof tooling
 *.prof
@@ -29,3 +33,4 @@ caddy-dist
 # IDE files
 .idea/
 .vscode/
+
