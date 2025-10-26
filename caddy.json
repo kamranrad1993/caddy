@@ -1,37 +1,7 @@
 {
-    "admin": {
-        "listen": "127.0.0.1:2019",
-        "enforce_origin": false,
-        "origins": [
-            "http://localhost:2019",
-            "localhost:2019",
-            "localhost",
-            "http://127.0.0.1:2019",
-            "127.0.0.1:2019",
-            "127.0.0.1"
-        ]
-    },
-    "logging": {
-        "logs": {
-            "default": {
-                "writer": {
-                    "filename": "/var/log/caddy/access.log",
-                    "output": "file"
-                },
-                "encoder": {
-                    "format": "json"
-                },
-                "level": "INFO"
-            }
-        }
-    },
-    "storage": {
-        "host": "172.17.0.2",
-        "dbname": "postgres",
-        "user": "postgres",
-        "module": "postgres",
-        "password": "123",
-        "port": "5432",
-        "sslmode": "disable"
-    }
+    "addr": "172.17.0.3:6379",
+    "password": "",
+    "db": 0,
+    "key_prefix": "caddy:config",
+    "channel": "caddy:config:updates"
 }

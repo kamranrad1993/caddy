@@ -32,6 +32,7 @@ import (
 	caddycmd "github.com/caddyserver/caddy/v2/cmd"
 
 	// plug in Caddy modules here
+	_ "github.com/caddyserver/caddy/v2/caddyconfig/redis"
 	_ "github.com/caddyserver/caddy/v2/modules/standard"
 	_ "github.com/yroc92/postgres-storage"
 )
