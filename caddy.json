@@ -3,5 +3,6 @@
     "password": "",
     "db": 0,
     "key_prefix": "caddy:config",
-    "channel": "caddy:config:updates"
+    "channel": "caddy:config:updates",
+    "reload_debounce": 10
 }

@@ -7,6 +7,8 @@ import (
 	"log"
 	"os"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig"
@@ -19,18 +21,33 @@ func init() {
 	caddyconfig.RegisterAdapter("redis", RedisAdapter{})
 }
 
-// RedisAdapter implements the Caddy config adapter interface
-type RedisAdapter struct {
+// RedisAdapter is a Caddy config adapter that loads configuration from Redis.
+type RedisAdapter struct{}
+
+// ConfigManager handles thread-safe config updates and lifecycle
+type ConfigManager struct {
+	mu             sync.RWMutex
+	config         string
+	client         *redis.Client
+	keyPrefix      string
+	db             int
+	cancel         context.CancelFunc
+	logger         *zap.Logger
+	reloadDebounce time.Duration
+	lastReload     time.Time
+	pendingReload  bool        // Track if a reload is pending
+	reloadTimer    *time.Timer // Timer for pending reload
+	timerMu        sync.Mutex  // Separate mutex for timer operations
 }
 
-// Adapt loads the Caddy configuration from Redis
+// Adapt is called by Caddy when using --adapter redis.
 func (a RedisAdapter) Adapt(body []byte, options map[string]interface{}) ([]byte, []caddyconfig.Warning, error) {
 	ctx := context.Background()
 
-	// Parse Redis connection info from body or environment
 	var redisConfig RedisConfig
 
-	// If body is empty, try environment variables
+	// Try to parse Redis connection info from the config file,
+	// or fall back to environment variables if the file is empty
 	if len(body) == 0 || string(body) == "{}" {
 		redisConfig = getConfigFromEnv()
 	} else {
@@ -39,53 +56,87 @@ func (a RedisAdapter) Adapt(body []byte, options map[string]interface{}) ([]byte
 		}
 	}
 
-	// Set defaults
+	// Apply sensible defaults
 	if redisConfig.Addr == "" {
 		redisConfig.Addr = "localhost:6379"
 	}
 	if redisConfig.KeyPrefix == "" {
 		redisConfig.KeyPrefix = "caddy:config"
 	}
-	if redisConfig.Channel == "" {
-		redisConfig.Channel = "caddy:config:updates"
+	if redisConfig.ReloadDebounce == 0 {
+		redisConfig.ReloadDebounce = 1 * time.Second
 	}
 
-	// Create Redis client
 	client := redis.NewClient(&redis.Options{
-		Addr:     redisConfig.Addr,
-		Password: redisConfig.Password,
-		DB:       redisConfig.DB,
+		Addr:         redisConfig.Addr,
+		Password:     redisConfig.Password,
+		DB:           redisConfig.DB,
+		PoolSize:     10,
+		MinIdleConns: 2,
+		MaxRetries:   3,
+		DialTimeout:  5 * time.Second,
+		ReadTimeout:  3 * time.Second,
+		WriteTimeout: 3 * time.Second,
 	})
 
-	// Test connection
+	// Make sure we can actually connect before proceeding
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
 	if err := client.Ping(ctx).Err(); err != nil {
+		client.Close()
 		return nil, nil, fmt.Errorf("failed to connect to redis: %w", err)
 	}
 
-	// Load initial config from Redis
+	// Load the initial configuration from Redis
 	config, err := loadConfigFromRedis(ctx, client, redisConfig.KeyPrefix)
 	if err != nil {
+		client.Close()
 		return nil, nil, fmt.Errorf("failed to load config from redis: %w", err)
 	}
 
-	// Set notify-keyspace-events = KEA
-	err = client.ConfigSet(ctx, "notify-keyspace-events", "KEA").Err()
-	if err != nil {
-		log.Fatalf("Failed to set Redis config: %v", err)
+	// Validate initial config
+	if !json.Valid([]byte(config)) {
+		client.Close()
+		return nil, nil, fmt.Errorf("invalid JSON config loaded from Redis")
 	}
 
-	// Start pub/sub listener in background
-	go startPubSubListener(client, redisConfig.KeyPrefix, &config)
+	// Enable keyspace notifications so we can watch for changes.
+	if err := enableKeyspaceNotifications(ctx, client); err != nil {
+		log.Printf("Warning: Failed to set Redis keyspace events: %v", err)
+	}
+
+	// Create config manager with proper lifecycle management
+	bgCtx, bgCancel := context.WithCancel(context.Background())
+	manager := &ConfigManager{
+		config:         config,
+		client:         client,
+		keyPrefix:      redisConfig.KeyPrefix,
+		db:             redisConfig.DB,
+		cancel:         bgCancel,
+		logger:         caddy.Log().Named("redis-adapter"),
+		reloadDebounce: redisConfig.ReloadDebounce * time.Second,
+		pendingReload:  false,
+	}
+
+	// Start listening for config changes in the background
+	go manager.startPubSubListener(bgCtx)
+
+	// Register cleanup on Caddy shutdown
+	caddy.OnExit(func(ctx context.Context) {
+		manager.Shutdown()
+
+	})
 
 	return []byte(config), nil, nil
 }
 
 type RedisConfig struct {
-	Addr      string `json:"addr"`
-	Password  string `json:"password,omitempty"`
-	DB        int    `json:"db"`
-	KeyPrefix string `json:"key_prefix"`
-	Channel   string `json:"channel"`
+	Addr           string        `json:"addr"`
+	Password       string        `json:"password,omitempty"`
+	DB             int           `json:"db"`
+	KeyPrefix      string        `json:"key_prefix"`
+	ReloadDebounce time.Duration `json:"reload_debounce,omitempty"`
 }
 
 func getConfigFromEnv() RedisConfig {
@@ -93,39 +144,97 @@ func getConfigFromEnv() RedisConfig {
 		Addr:      os.Getenv("REDIS_ADDR"),
 		Password:  os.Getenv("REDIS_PASSWORD"),
 		KeyPrefix: os.Getenv("REDIS_KEY_PREFIX"),
-		Channel:   os.Getenv("REDIS_CHANNEL"),
 	}
 
-	// Parse DB as int
 	if dbStr := os.Getenv("REDIS_DB"); dbStr != "" {
 		fmt.Sscanf(dbStr, "%d", &cfg.DB)
+	}
+
+	if debounceStr := os.Getenv("REDIS_RELOAD_DEBOUNCE"); debounceStr != "" {
+		if d, err := time.ParseDuration(debounceStr); err == nil {
+			cfg.ReloadDebounce = d
+		}
 	}
 
 	return cfg
 }
 
+// enableKeyspaceNotifications configures Redis to send keyspace events
+func enableKeyspaceNotifications(ctx context.Context, client *redis.Client) error {
+	return client.ConfigSet(ctx, "notify-keyspace-events", "KEA").Err()
+}
+
+// isValidJSON does a quick check to see if a string looks like JSON
+func isValidJSON(s string) bool {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return false
+	}
+
+	firstChar := s[0]
+	if firstChar != '{' && firstChar != '[' && firstChar != '"' &&
+		s != "true" && s != "false" && s != "null" {
+		return false
+	}
+
+	var js interface{}
+	return json.Unmarshal([]byte(s), &js) == nil
+}
+
+// setValueInConfig intelligently sets a value in the JSON config.
+func setValueInConfig(config, jsonPath, value string) (string, error) {
+	value = strings.TrimSpace(value)
+
+	if isValidJSON(value) {
+		// SetRaw preserves the JSON structure exactly as-is
+		return sjson.SetRaw(config, jsonPath, value)
+	}
+
+	// Set automatically quotes plain strings for us
+	return sjson.Set(config, jsonPath, value)
+}
+
+// loadConfigFromRedis scans all keys matching our prefix and rebuilds
+// the complete JSON config from scratch.
 func loadConfigFromRedis(ctx context.Context, client *redis.Client, keyPrefix string) (string, error) {
 	pattern := keyPrefix + ":*"
 	var cursor uint64
+	config := "{}"
 
-	config := ""
-
+	// SCAN is better than KEYS for production - it doesn't block Redis
 	for {
 		keys, nextCursor, err := client.Scan(ctx, cursor, pattern, 100).Result()
 		if err != nil {
 			return "", fmt.Errorf("failed to scan keys: %w", err)
 		}
 
-		for _, key := range keys {
-			val, err := client.Get(ctx, key).Result()
-			if err != nil {
-				continue // Skip missing keys
-			}
-			jsonPath := strings.TrimPrefix(key, keyPrefix+":")
+		// Batch GET operations for better performance
+		if len(keys) > 0 {
+			pipe := client.Pipeline()
+			cmds := make(map[string]*redis.StringCmd, len(keys))
 
-			config, err = sjson.Set(config, jsonPath, val)
-			if err != nil {
-				return "", fmt.Errorf("failed to set value for path %s: %w", jsonPath, err)
+			for _, key := range keys {
+				cmds[key] = pipe.Get(ctx, key)
+			}
+
+			if _, err := pipe.Exec(ctx); err != nil && err != redis.Nil {
+				// Continue even if some keys fail
+				log.Printf("Warning: Pipeline exec error: %v", err)
+			}
+
+			for key, cmd := range cmds {
+				val, err := cmd.Result()
+				if err != nil {
+					continue // Key might have been deleted
+				}
+
+				// Remove the prefix to get the JSON path
+				jsonPath := strings.TrimPrefix(key, keyPrefix+":")
+
+				config, err = setValueInConfig(config, jsonPath, val)
+				if err != nil {
+					return "", fmt.Errorf("failed to set value for path %s: %w", jsonPath, err)
+				}
 			}
 		}
 
@@ -134,65 +243,217 @@ func loadConfigFromRedis(ctx context.Context, client *redis.Client, keyPrefix st
 			break
 		}
 	}
+
 	return config, nil
 }
 
-func startPubSubListener(client *redis.Client, keyPrefix string, currentConfig *string) {
-	ctx := context.Background()
-	keyspacePrefix := "__keyspace@0__:"
-	pubsub := client.PSubscribe(ctx, keyspacePrefix+keyPrefix+":*")
-	defer pubsub.Close()
+// GetConfig returns a thread-safe copy of the current config
+func (cm *ConfigManager) GetConfig() string {
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+	return cm.config
+}
 
-	logger := caddy.Log().Named("redis-config-loader")
-	prefix := "__keyspace@0__:" + keyPrefix + ":"
+// UpdateConfig updates the config in a thread-safe manner
+func (cm *ConfigManager) UpdateConfig(newConfig string) {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	cm.config = newConfig
+}
 
-	ch := pubsub.Channel()
-	for msg := range ch {
-		logger.Info("received config update", zap.String("message", msg.Channel))
+// scheduleReload schedules a reload after the debounce period
+// This ensures pending changes are applied even if no new events arrive
+func (cm *ConfigManager) scheduleReload() {
+	cm.timerMu.Lock()
+	defer cm.timerMu.Unlock()
 
-		// // Small delay to allow multiple updates to complete
-		// time.Sleep(100 * time.Millisecond)
-		key := strings.TrimPrefix(msg.Channel, keyspacePrefix)
-		jsonPath := strings.TrimPrefix(msg.Channel, prefix)
+	now := time.Now()
+	timeSinceLastReload := now.Sub(cm.lastReload)
 
-		value := client.Get(ctx, key)
+	// If we're within the debounce window, schedule a reload
+	if timeSinceLastReload < cm.reloadDebounce {
+		cm.pendingReload = true
 
-		switch msg.Payload {
-		case "set", "rename_to":
-			var err error = nil
-			*currentConfig, err = sjson.Set(*currentConfig, jsonPath, value.Val())
-			if err != nil {
-				logger.Error("failed to reload config", zap.Error(err))
-			}
-			break
-		case "rename_from", "del", "evicted", "expired":
-			var err error = nil
-			*currentConfig, err = sjson.Delete(*currentConfig, jsonPath)
-			if err != nil {
-				logger.Error("failed to reload config", zap.Error(err))
-			}
-			break
+		// Cancel existing timer if any
+		if cm.reloadTimer != nil {
+			cm.reloadTimer.Stop()
 		}
 
-		fmt.Printf(*currentConfig)
-		err := caddy.Load([]byte(*currentConfig), true)
-		if err != nil {
-			logger.Error("failed to reload config", zap.Error(err))
+		// Schedule reload after remaining debounce time
+		remainingTime := cm.reloadDebounce - timeSinceLastReload
+		cm.reloadTimer = time.AfterFunc(remainingTime, func() {
+			cm.executePendingReload()
+		})
+
+		cm.logger.Debug("scheduled pending reload",
+			zap.Duration("in", remainingTime))
+	} else {
+		// We can reload immediately
+		cm.mu.Lock()
+		cm.lastReload = now
+		cm.mu.Unlock()
+
+		cm.reloadCaddy(cm.GetConfig())
+	}
+}
+
+// executePendingReload executes a pending reload if one exists
+func (cm *ConfigManager) executePendingReload() {
+	cm.timerMu.Lock()
+	defer cm.timerMu.Unlock()
+
+	if !cm.pendingReload {
+		return
+	}
+
+	cm.pendingReload = false
+	cm.mu.Lock()
+	cm.lastReload = time.Now()
+	cm.mu.Unlock()
+
+	cm.logger.Info("executing pending reload")
+	cm.reloadCaddy(cm.GetConfig())
+}
+
+// startPubSubListener watches Redis keyspace events and applies changes in real-time
+func (cm *ConfigManager) startPubSubListener(ctx context.Context) {
+	keyspacePrefix := fmt.Sprintf("__keyspace@%d__:", cm.db)
+	pattern := keyspacePrefix + cm.keyPrefix + ":*"
+	prefix := keyspacePrefix + cm.keyPrefix + ":"
+
+	cm.logger.Info("started redis keyspace listener",
+		zap.String("pattern", pattern))
+
+	for {
+		select {
+		case <-ctx.Done():
+			cm.logger.Info("stopping redis keyspace listener")
+			return
+		default:
+		}
+
+		pubsub := cm.client.PSubscribe(ctx, pattern)
+		ch := pubsub.Channel()
+
+		func() {
+			defer pubsub.Close()
+
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case msg, ok := <-ch:
+					if !ok {
+						cm.logger.Warn("pubsub channel closed, reconnecting...")
+						return
+					}
+
+					cm.handleKeyspaceEvent(ctx, msg, prefix)
+				}
+			}
+		}()
+
+		// Reconnection backoff
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(5 * time.Second):
+			cm.logger.Info("attempting to reconnect pubsub...")
 		}
 	}
 }
 
-func reloadConfig(ctx context.Context, client *redis.Client, keyPrefix string) error {
-	config, err := loadConfigFromRedis(ctx, client, keyPrefix)
-	if err != nil {
-		return fmt.Errorf("failed to load config: %w", err)
+// handleKeyspaceEvent processes individual keyspace events
+func (cm *ConfigManager) handleKeyspaceEvent(ctx context.Context, msg *redis.Message, prefix string) {
+	key := strings.TrimPrefix(msg.Channel, "__keyspace@"+fmt.Sprintf("%d", cm.db)+"__:")
+	jsonPath := strings.TrimPrefix(msg.Channel, prefix)
+
+	cm.logger.Info("keyspace event",
+		zap.String("event", msg.Payload),
+		zap.String("key", key),
+		zap.String("path", jsonPath))
+
+	currentConfig := cm.GetConfig()
+	var newConfig string
+	var err error
+
+	switch msg.Payload {
+	case "set", "rename_to":
+		// Someone updated a key - grab the new value and apply it
+		value, getErr := cm.client.Get(ctx, key).Result()
+		if getErr != nil {
+			cm.logger.Error("failed to get value", zap.Error(getErr))
+			return
+		}
+
+		newConfig, err = setValueInConfig(currentConfig, jsonPath, value)
+		if err != nil {
+			cm.logger.Error("failed to set config value",
+				zap.String("path", jsonPath),
+				zap.Error(err))
+			return
+		}
+
+	case "rename_from", "del", "evicted", "expired":
+		// Key was removed - delete it from our config too
+		newConfig, err = sjson.Delete(currentConfig, jsonPath)
+		if err != nil {
+			cm.logger.Error("failed to delete config value",
+				zap.String("path", jsonPath),
+				zap.Error(err))
+			return
+		}
+
+	default:
+		// Ignore other events
+		return
 	}
 
-	err = caddy.Load([]byte(config), true)
+	// Update the stored config
+	cm.UpdateConfig(newConfig)
 
-	if err != nil {
-		return fmt.Errorf("failed to reload caddy: %w", err)
+	// Schedule reload with debouncing
+	// This will ensure the reload happens even if no new events arrive
+	cm.scheduleReload()
+}
+
+// reloadCaddy validates and applies the new configuration
+func (cm *ConfigManager) reloadCaddy(config string) {
+	cm.logger.Info("reloading caddy configuration")
+
+	// Double-check the JSON is valid before trying to load it
+	if !json.Valid([]byte(config)) {
+		cm.logger.Error("invalid JSON config after update, skipping reload")
+		return
 	}
 
-	return nil
+	// Tell Caddy to apply the new config
+	err := caddy.Load([]byte(config), true)
+	if err != nil {
+		cm.logger.Error("failed to reload caddy", zap.Error(err))
+	} else {
+		cm.logger.Info("caddy configuration reloaded successfully")
+	}
+}
+
+// Shutdown gracefully stops the config manager
+func (cm *ConfigManager) Shutdown() {
+	cm.logger.Info("shutting down redis adapter")
+
+	// Stop any pending reload timer
+	cm.timerMu.Lock()
+	if cm.reloadTimer != nil {
+		cm.reloadTimer.Stop()
+	}
+	cm.timerMu.Unlock()
+
+	if cm.cancel != nil {
+		cm.cancel()
+	}
+
+	if cm.client != nil {
+		if err := cm.client.Close(); err != nil {
+			cm.logger.Error("error closing redis client", zap.Error(err))
+		}
+	}
 }

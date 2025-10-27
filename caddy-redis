@@ -21,3 +21,25 @@ redis-cli SET "caddy:config:apps.redisadapter.password" ""
 redis-cli SET "caddy:config:apps.redisadapter.db" 0
 redis-cli SET "caddy:config:apps.redisadapter.key_prefix" "caddy:config"
 redis-cli SET "caddy:config:apps.redisadapter.channel" "caddy:config:updates"
+
+redis-cli SET "caddy:config:apps.http.servers.example.listen[0]" ":2015"
+redis-cli SET "caddy:config:apps.http.servers.example.routes[0].handle[0].handler" "static_response"
+redis-cli SET "caddy:config:apps.http.servers.example.routes[0].handle[0].body" "Hello, world!"
+
+jq -r 'paths(scalars) as $p |
+        (
+        $p | map(
+            if type=="number" then "[" + tostring + "]"
+            else "." + .
+            end
+        ) | join("") | ltrimstr(".")
+        ) + " " + (getpath($p) | @json)' file.json
+
+
+jq -r 'paths(scalars) as $p |
+        ($p | map(
+                if type=="number" then "." + tostring
+                else "." + .
+                end
+            ) | join("") | ltrimstr(".")
+        ) + " " + (getpath($p) | @json)' $a
