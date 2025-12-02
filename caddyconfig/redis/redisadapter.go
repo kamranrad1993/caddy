@@ -13,6 +13,7 @@ import (
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig"
 	"github.com/redis/go-redis/v9"
+	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 	"go.uber.org/zap"
 )
@@ -192,6 +193,49 @@ func setValueInConfig(config, jsonPath, value string) (string, error) {
 
 	// Set automatically quotes plain strings for us
 	return sjson.Set(config, jsonPath, value)
+}
+
+// cleanupEmptyParents removes empty parent objects/arrays after a key deletion.
+// It traverses up the JSON path and removes empty containers.
+func cleanupEmptyParents(config, jsonPath string) (string, error) {
+	result := config
+
+	// Parse the JSON path to get parent paths
+	parts := strings.Split(jsonPath, ".")
+
+	// Iterate backwards through the path hierarchy to clean up empty parents
+	for i := len(parts) - 1; i >= 0; i-- {
+		// Build current parent path
+		parentPath := strings.Join(parts[:i], ".")
+		if parentPath == "" {
+			break
+		}
+
+		// Get the parent value and check if it's empty
+		parentResult := gjson.Get(result, parentPath)
+		if !parentResult.Exists() {
+			continue
+		}
+
+		// Check if parent is empty object or array
+		if parentResult.IsObject() && len(parentResult.Map()) == 0 {
+			// Parent is an empty object, remove it
+			var err error
+			result, err = sjson.Delete(result, parentPath)
+			if err != nil {
+				return result, fmt.Errorf("failed to delete empty object at %s: %w", parentPath, err)
+			}
+		} else if parentResult.IsArray() && len(parentResult.Array()) == 0 {
+			// Parent is an empty array, remove it
+			var err error
+			result, err = sjson.Delete(result, parentPath)
+			if err != nil {
+				return result, fmt.Errorf("failed to delete empty array at %s: %w", parentPath, err)
+			}
+		}
+	}
+
+	return result, nil
 }
 
 // loadConfigFromRedis scans all keys matching our prefix and rebuilds
@@ -387,6 +431,11 @@ func (cm *ConfigManager) handleKeyspaceEvent(ctx context.Context, msg *redis.Mes
 		}
 
 		newConfig, err = setValueInConfig(currentConfig, jsonPath, value)
+
+		cm.logger.Info(msg.Payload,
+			zap.String("jsonPath", jsonPath),
+			zap.String("value", value))
+
 		if err != nil {
 			cm.logger.Error("failed to set config value",
 				zap.String("path", jsonPath),
@@ -397,12 +446,25 @@ func (cm *ConfigManager) handleKeyspaceEvent(ctx context.Context, msg *redis.Mes
 	case "rename_from", "del", "evicted", "expired":
 		// Key was removed - delete it from our config too
 		newConfig, err = sjson.Delete(currentConfig, jsonPath)
+
 		if err != nil {
 			cm.logger.Error("failed to delete config value",
 				zap.String("path", jsonPath),
 				zap.Error(err))
 			return
 		}
+
+		// Clean up any empty parent objects that might result from the deletion
+		newConfig, err = cleanupEmptyParents(newConfig, jsonPath)
+		if err != nil {
+			cm.logger.Error("failed to clean up empty parents after deletion",
+				zap.String("path", jsonPath),
+				zap.Error(err))
+			// Continue with the config even if cleanup fails, to avoid losing the main deletion
+		}
+
+		cm.logger.Info(msg.Payload,
+			zap.String("jsonPath", jsonPath))
 
 	default:
 		// Ignore other events
@@ -420,6 +482,7 @@ func (cm *ConfigManager) handleKeyspaceEvent(ctx context.Context, msg *redis.Mes
 // reloadCaddy validates and applies the new configuration
 func (cm *ConfigManager) reloadCaddy(config string) {
 	cm.logger.Info("reloading caddy configuration")
+	cm.logger.Info(config)
 
 	// Double-check the JSON is valid before trying to load it
 	if !json.Valid([]byte(config)) {
