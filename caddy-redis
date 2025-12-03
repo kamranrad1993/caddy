@@ -1,30 +1,56 @@
 redis-cli SET "caddy:config:admin.listen" "127.0.0.1:2019"
-redis-cli SET "caddy:config:admin.origins[0]" "http://localhost:2019"
-redis-cli SET "caddy:config:admin.origins[1]" "localhost:2019"
-redis-cli SET "caddy:config:admin.origins[2]" "localhost"
-redis-cli SET "caddy:config:admin.origins[3]" "http://127.0.0.1:2019"
-redis-cli SET "caddy:config:admin.origins[4]" "127.0.0.1:2019"
-redis-cli SET "caddy:config:admin.origins[5]" "127.0.0.1"
+redis-cli SET "caddy:config:admin.origins.0" "http://localhost:2019"
+redis-cli SET "caddy:config:admin.origins.1" "localhost:2019"
+redis-cli SET "caddy:config:admin.origins.2" "localhost"
+redis-cli SET "caddy:config:admin.origins.3" "http://127.0.0.1:2019"
+redis-cli SET "caddy:config:admin.origins.4" "127.0.0.1:2019"
+redis-cli SET "caddy:config:admin.origins.5" "127.0.0.1"
 redis-cli SET "caddy:config:logging.logs.default.writer.filename" "/var/log/caddy/access.log"
 redis-cli SET "caddy:config:logging.logs.default.writer.output" "file"
 redis-cli SET "caddy:config:logging.logs.default.encoder.format" "json"
 redis-cli SET "caddy:config:logging.logs.default.level" "INFO"
-redis-cli SET "caddy:config:storage.host" "172.17.0.2"
+redis-cli SET "caddy:config:storage.host" "127.0.0.1"
 redis-cli SET "caddy:config:storage.dbname" "postgres"
 redis-cli SET "caddy:config:storage.user" "postgres"
 redis-cli SET "caddy:config:storage.module" "postgres"
 redis-cli SET "caddy:config:storage.password" "123"
 redis-cli SET "caddy:config:storage.port" "5432"
 redis-cli SET "caddy:config:storage.sslmode" "disable"
-redis-cli SET "caddy:config:apps.redisadapter.address" "172.17.0.3:6379"
-redis-cli SET "caddy:config:apps.redisadapter.password" ""
-redis-cli SET "caddy:config:apps.redisadapter.db" 0
-redis-cli SET "caddy:config:apps.redisadapter.key_prefix" "caddy:config"
-redis-cli SET "caddy:config:apps.redisadapter.channel" "caddy:config:updates"
 
-redis-cli SET "caddy:config:apps.http.servers.example.listen[0]" ":2015"
-redis-cli SET "caddy:config:apps.http.servers.example.routes[0].handle[0].handler" "static_response"
-redis-cli SET "caddy:config:apps.http.servers.example.routes[0].handle[0].body" "Hello, world!"
+redis-cli SET "caddy:config:apps.http.servers.example.listen.0" ":2015"
+redis-cli SET "caddy:config:apps.http.servers.example.listen.1" "unix//tmp/example-service.sock"
+redis-cli SET "caddy:config:apps.http.servers.example.routes.0.handle.0.handler" "static_response"
+redis-cli SET "caddy:config:apps.http.servers.example.routes.0.handle.0.body" "Hello, world!"
+
+redis-cli SET "caddy:config:apps.http.servers.main.listen.0" ":3443"
+redis-cli SET "caddy:config:apps.http.servers.main.listen.1" ":3480"
+redis-cli SET "caddy:config:apps.http.servers.main.automatic_https.disable_redirects" "true"
+redis-cli SET "caddy:config:apps.http.servers.main.automatic_https.disable_certificates" "true"
+
+redis-cli SET "caddy:config:apps.http.servers.main.routes.0.handle.0.handler" "reverse_proxy"
+redis-cli SET "caddy:config:apps.http.servers.main.routes.0.handle.0.upstreams.0.dial" "unix//tmp/example-service.sock"
+
+redis-cli SET "caddy:config:apps.http.servers.main.routes.0.match.0.host.0" "example.com"
+redis-cli SET "caddy:config:apps.http.servers.main.routes.0.handle.0.handler" "file_server"
+redis-cli SET "caddy:config:apps.http.servers.main.routes.0.handle.0.root" "/var/www/example"
+redis-cli SET "caddy:config:apps.http.servers.main.routes.1.match.0.host.0" "example.com"
+redis-cli SET "caddy:config:apps.http.servers.main.routes.1.match.0.path.0" "/api/*"
+redis-cli SET "caddy:config:apps.http.servers.main.routes.1.handle.0.handler" "reverse_proxy"
+redis-cli SET "caddy:config:apps.http.servers.main.routes.1.handle.0.upstreams.0.dial" "localhost:8081"
+redis-cli SET "caddy:config:apps.http.servers.main.routes.2.match.0.host.0" "blog.example.com"
+redis-cli SET "caddy:config:apps.http.servers.main.routes.2.handle.0.handler" "file_server"
+redis-cli SET "caddy:config:apps.http.servers.main.routes.2.handle.0.root" "/var/www/blog"
+redis-cli SET "caddy:config:apps.http.servers.main.routes.3.match.0.host.0" "blog.example.com"
+redis-cli SET "caddy:config:apps.http.servers.main.routes.3.match.0.path.0" "/api*"
+redis-cli SET "caddy:config:apps.http.servers.main.routes.3.handle.0.handler" "reverse_proxy"
+redis-cli SET "caddy:config:apps.http.servers.main.routes.3.handle.0.upstreams.0.dial" "localhost:5000"
+redis-cli SET "caddy:config:apps.http.servers.main.routes.4.match.0.host.0" "shop.example.com"
+redis-cli SET "caddy:config:apps.http.servers.main.routes.4.handle.0.handler" "reverse_proxy"
+redis-cli SET "caddy:config:apps.http.servers.main.routes.4.handle.0.upstreams.0.dial" "127.0.0.1:9000"
+redis-cli SET "caddy:config:apps.http.servers.main.routes.9.match.0.host.0" "static.example.com"
+redis-cli SET "caddy:config:apps.http.servers.main.routes.9.handle.0.handler" "file_server"
+redis-cli SET "caddy:config:apps.http.servers.main.routes.9.handle.0.root" "/srv/static"
+
 
 jq -r 'paths(scalars) as $p |
         (
@@ -38,6 +64,14 @@ jq -r 'paths(scalars) as $p |
 
 jq -r 'paths(scalars) as $p |
         ($p | map(
+                if type=="number" then "." + tostring
+                else "." + .
+                end
+            ) | join("") | ltrimstr(".")
+        ) + " " + (getpath($p) | @json)' $a
+
+jq -r 'paths(scalars) as $p |
+        "caddy:config:" + ($p | map(
                 if type=="number" then "." + tostring
                 else "." + .
                 end

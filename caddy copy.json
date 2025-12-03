@@ -44,6 +44,25 @@
             "db": 0,
             "key_prefix": "caddy:config",
             "channel": "caddy:config:updates"
+        },
+        "http": {
+            "servers": {
+                "example": {
+                    "listen": [
+                        ":2015"
+                    ],
+                    "routes": [
+                        {
+                            "handle": [
+                                {
+                                    "handler": "static_response",
+                                    "body": "Hello, world!"
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
         }
     }
 }

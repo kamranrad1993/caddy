@@ -1,0 +1,209 @@
+{
+    "admin": {
+        "listen": "127.0.0.1:2019",
+        "enforce_origin": false,
+        "config": {
+            "persist": false
+        }
+    },
+    "logging": {
+        "logs": {
+            "default": {
+                "writer": {
+                    "filename": "/var/log/caddy/access.log",
+                    "output": "file"
+                },
+                "encoder": {
+                    "format": "json"
+                },
+                "level": "INFO"
+            }
+        }
+    },
+    "apps": {
+        "http": {
+            "servers": {
+                "example": {
+                    "listen": [
+                        "unix//tmp/example-service.sock"
+                    ],
+                    "routes": [
+                        {
+                            "match": [
+                                {
+                                    "host": [
+                                        "example.zloud.ir"
+                                    ]
+                                }
+                            ],
+                            "handle": [
+                                {
+                                    "body": "Hello, world!",
+                                    "handler": "static_response"
+                                }
+                            ]
+                        }
+                    ],
+                    "automatic_https": {
+                        "disable": false,
+                        "disable_redirects": true,
+                        "disable_certificates": false,
+                        "ignore_loaded_certificates": false
+                    }
+                },
+                "example2": {
+                    "listen": [
+                        "unix//tmp/example2-service.sock"
+                    ],
+                    "routes": [
+                        {
+                            "match": [
+                                {
+                                    "host": [
+                                        "example2.zloud.ir"
+                                    ]
+                                }
+                            ],
+                            "handle": [
+                                {
+                                    "body": "Hello, world! 2",
+                                    "handler": "static_response"
+                                }
+                            ]
+                        }
+                    ],
+                    "automatic_https": {
+                        "disable": false,
+                        "disable_redirects": true,
+                        "disable_certificates": false,
+                        "ignore_loaded_certificates": false
+                    }
+                },
+                "main-http": {
+                    "listen": [
+                        ":80"
+                    ],
+                    "routes": [
+                        {
+                            "match": [
+                                {
+                                    "host": [
+                                        "example.zloud.ir"
+                                    ]
+                                }
+                            ],
+                            "handle": [
+                                {
+                                    "handler": "static_response",
+                                    "headers": {
+                                        "Location": [
+                                            "https://{http.request.host}{http.request.uri}"
+                                        ]
+                                    },
+                                    "status_code": 308
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "main-https": {
+                    "listen": [
+                        ":443"
+                    ],
+                    "routes": [
+                        {
+                            "match": [
+                                {
+                                    "host": [
+                                        "example.zloud.ir"
+                                    ]
+                                }
+                            ],
+                            "handle": [
+                                {
+                                    "handler": "reverse_proxy",
+                                    "transport": {
+                                        "protocol": "http",
+                                        "tls": {
+                                            "insecure_skip_verify": true,
+                                            "server_name": "example.zloud.ir"
+                                        }
+                                    },
+                                    "upstreams": [
+                                        {
+                                            "dial": "unix//tmp/example-service.sock"
+                                        }
+                                    ]
+                                }
+                            ]
+                        },
+                        {
+                            "match": [
+                                {
+                                    "host": [
+                                        "example2.zloud.ir"
+                                    ]
+                                }
+                            ],
+                            "handle": [
+                                {
+                                    "handler": "reverse_proxy",
+                                    "transport": {
+                                        "protocol": "http",
+                                        "tls": {
+                                            "insecure_skip_verify": true,
+                                            "server_name": "example2.zloud.ir"
+                                        }
+                                    },
+                                    "upstreams": [
+                                        {
+                                            "dial": "unix//tmp/example2-service.sock"
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
+        },
+        "tls": {
+            "automation": {
+                "policies": [
+                    {
+                        "subjects": [
+                            "example.zloud.ir"
+                        ],
+                        "storage": {
+                            "module": "file_system",
+                            "root": "/var/lib/caddy/example-service"
+                        },
+                        "issuers": [
+                            {
+                                "module": "acme",
+                                "ca": "https://acme-v02.api.letsencrypt.org/directory",
+                                "email": "kamrad1372@gmail.com"
+                            }
+                        ]
+                    },
+                    {
+                        "subjects": [
+                            "example2.zloud.ir"
+                        ],
+                        "storage": {
+                            "module": "file_system",
+                            "root": "/var/lib/caddy/example2-service"
+                        },
+                        "issuers": [
+                            {
+                                "module": "acme",
+                                "ca": "https://acme-v02.api.letsencrypt.org/directory",
+                                "email": "kamrad1372@gmail.com"
+                            }
+                        ]
+                    }
+                ]
+            }
+        }
+    }
+}
